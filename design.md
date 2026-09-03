@@ -477,7 +477,12 @@ class Result:
 
 @dataclass(frozen=True)
 class RunContext:
-    """1 回の実行を再現するために必要な情報のすべて。"""
+    """1 回の実行を再現するために必要な情報のすべて。
+
+    policy_constants は frozen dataclass に mutable な dict を入れる唯一の例外である。
+    VideoInfo.raw_probe を削除した理由（hash() が TypeError になる）は RunContext にも
+    当てはまるが、RunContext は hash せず meta.json へ json.dumps() するだけなので許容する。
+    """
 
     run_id: str
     started_at: datetime
