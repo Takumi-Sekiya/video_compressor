@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# 実素材と実行時ディレクトリはリポジトリに含めない
+*.mp4
+*.mov
+*.m4v
+*.part
