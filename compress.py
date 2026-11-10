@@ -43,6 +43,8 @@ EXIT_FATAL: int = 3
 
 @dataclass(frozen=True)
 class CliArgs:
+    """解析済みのコマンドライン引数。判定とエンコードのパラメータは options にまとめる。"""
+
     root: Path
     options: Options
     dry_run: bool

@@ -125,3 +125,37 @@ PowerShell でリポジトリ直下から実行する。`<素材>` は代表素�
 
 CSV は先頭に BOM 付きの UTF-8（utf-8-sig）で書いており、BOM が先頭に 1 つだけあることは `tests/test_runlog.py` で確認している。
 Excel での表示は未確認。
+
+### 段階 3: fixture の収集（未実施）
+
+手順は `fixtures/probe/README.md`。6 種類を置いたら `pytest -rs` を実行し、
+`fixture 未収集` による skip が 0 件になり、すべて通ることを確認する（段階 4 の完了条件）。
+
+### 段階 11: 実素材での試運転（未実施）
+
+**実運用の共有フォルダとは別の作業用 `<root>` で行う。** iPhone からはコピーするので、iPhone 側の原本は残る。
+
+1. 作業用の `<root>`（例: `D:\vc_trial`）を作り、代表素材 5〜10 本を iPhone から `in\` にコピーする。
+   横位置 / 縦位置 / HDR / スローモーション / 音声なし / 4K を含める
+2. `samples/manifest.txt` に、調整日・端末・撮影設定と、素材ごとの期待判定を書く
+3. **転送完了検知の確認（C-1）**: 大きめの素材を iPhone からコピーしている最中に、次を実行する
+
+   ```powershell
+   while ($true) { Get-Item D:\vc_trial\in\<コピー中の素材> | Select-Object Length, LastWriteTime; Start-Sleep 2 }
+   ```
+
+   コピー中に `LastWriteTime` が現在時刻に更新され続けること。古い撮影日時のまま `Length` だけが増える場合は、
+   `wait_until_stable()` の「mtime が 30 秒以上前なら即 True」の前提が崩れているので、本実行に進まずに設計を見直す
+4. dry-run の判定が `samples/manifest.txt` の期待と一致すること
+
+   ```powershell
+   python compress.py --root D:\vc_trial --dry-run
+   ```
+
+5. **1 本だけ本実行する（C-2 / C-3）**: `in\` に縦位置素材を 1 本だけ残して本実行し、`out\` の出力を iPhone に戻して確認する
+   - 再生できる（`hvc1` タグ）
+   - **縦位置のまま再生される**
+   - 撮影日時が引き継がれている。「ファイル」アプリでの並び順が原本と同じ（出力の mtime が `done\` の原本と一致）
+6. 残りを本実行し、`logs\` の CSV と meta.json が揃っていること、CSV が Excel で文字化けしないこと（段階 7）を確認する
+7. CSV の `bpp` / `bit_rate_source` / `fps_source` の分布を見て、B-1〜B-4 の閾値検証に進む。
+   調整中は `--keep-in` を使い、各サイクルの前に `out\` を空にする
