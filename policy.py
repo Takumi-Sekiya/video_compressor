@@ -593,3 +593,117 @@ def resolve_dest_dir(
     if reason is FailureReason.PROBE_FAILED:
         return layout.failed_dir
     return None
+
+
+def _resolution(width: int, height: int) -> str:
+    return f"{width}x{height}"
+
+
+def build_result(
+    run_id: str,
+    plan: Plan,
+    info: VideoInfo,
+    outcome: Outcome,
+    reason: Reason | None,
+    total_sec: float,
+    *,
+    output_size: int | None = None,
+    encode: EncodeResult | None = None,
+    moved_to: str | None = None,
+    detail: str | None = None,
+) -> Result:
+    """Plan と VideoInfo がある素材の Result を組み立てる。
+
+    output_size はエンコードが成功した場合に渡す（NO_GAIN / OUTPUT_INVALID でも渡す。
+    B-4 の閾値調整に破棄した出力のサイズ比が要るため）。output_name は ENCODED のときだけ埋める。
+    error_tail には ffmpeg が非ゼロ終了したときの stderr 末尾と detail を連結して入れる。
+
+    Raises:
+        ValueError: outcome と reason の組み合わせが矛盾するとき。
+    """
+    _check_outcome_reason(outcome, reason)
+    bit_rate = effective_bit_rate(info)
+    bpp = bits_per_pixel(info)
+    shown_width, shown_height = display_size(info)
+
+    errors: list[str] = []
+    if encode is not None and encode.returncode != 0 and encode.stderr_tail:
+        errors.append(encode.stderr_tail)
+    if detail:
+        errors.append(detail)
+
+    output_name = None
+    if outcome is Outcome.ENCODED and plan.output_path is not None:
+        output_name = plan.output_path.name
+    size_ratio = None
+    if output_size is not None and info.size_bytes > 0:
+        size_ratio = output_size / info.size_bytes
+
+    return Result(
+        run_id=run_id,
+        source_name=plan.source.name,
+        outcome=outcome,
+        reason=None if reason is None else reason.value,
+        source_size=info.size_bytes,
+        output_name=output_name,
+        output_size=output_size,
+        size_ratio=size_ratio,
+        moved_to=moved_to,
+        encode_sec=None if encode is None else encode.elapsed_sec,
+        total_sec=total_sec,
+        video_codec=info.video_codec,
+        resolution=_resolution(shown_width, shown_height),
+        stored_resolution=_resolution(info.width, info.height),
+        rotation=info.rotation,
+        fps=info.fps,
+        fps_source=info.fps_source,
+        bit_rate_bps=None if bit_rate is None else bit_rate[0],
+        bit_rate_source=None if bit_rate is None else bit_rate[1],
+        bpp=None if bpp is None else bpp[0],
+        color_transfer=info.color_transfer,
+        audio_codec=info.audio_codec,
+        ffmpeg_returncode=None if encode is None else encode.returncode,
+        error_tail="\n".join(errors) or None,
+    )
+
+
+def build_result_without_plan(
+    run_id: str,
+    source: Path,
+    source_size: int,
+    reason: Reason,
+    total_sec: float,
+    detail: str | None,
+    moved_to: str | None = None,
+) -> Result:
+    """Plan が存在しない素材（安定待ちタイムアウト、probe 失敗）の Result を組み立てる。
+
+    outcome は reason の型から決まる（SkipReason -> SKIPPED、FailureReason -> FAILED）。
+    """
+    outcome = Outcome.SKIPPED if isinstance(reason, SkipReason) else Outcome.FAILED
+    return Result(
+        run_id=run_id,
+        source_name=source.name,
+        outcome=outcome,
+        reason=reason.value,
+        source_size=source_size,
+        output_name=None,
+        output_size=None,
+        size_ratio=None,
+        moved_to=moved_to,
+        encode_sec=None,
+        total_sec=total_sec,
+        video_codec=None,
+        resolution=None,
+        stored_resolution=None,
+        rotation=None,
+        fps=None,
+        fps_source=None,
+        bit_rate_bps=None,
+        bit_rate_source=None,
+        bpp=None,
+        color_transfer=None,
+        audio_codec=None,
+        ffmpeg_returncode=None,
+        error_tail=detail or None,
+    )

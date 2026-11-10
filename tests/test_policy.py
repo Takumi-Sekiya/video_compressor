@@ -460,3 +460,58 @@ def test_resolve_dest_dir_table_spot_checks() -> None:
     assert policy.resolve_dest_dir(LAYOUT, Outcome.FAILED, FailureReason.PROBE_FAILED) == Path("root/failed")
     assert policy.resolve_dest_dir(LAYOUT, Outcome.FAILED, FailureReason.ENCODE_FAILED) is None
     assert policy.resolve_dest_dir(LAYOUT, Outcome.FAILED, FailureReason.OUTPUT_INVALID) is None
+
+
+# --- build_result / build_result_without_plan（段階 8） ---
+
+
+def _encode_plan() -> Plan:
+    return Plan(SRC, Action.ENCODE, None, OUT, ARGS)
+
+
+def test_build_result_encoded() -> None:
+    info = make_info(rotation=90)
+    encode = policy.EncodeResult(0, "", 2.0)
+    result = policy.build_result(
+        "rid", _encode_plan(), info, Outcome.ENCODED, None, 3.0,
+        output_size=5_000_000, encode=encode, moved_to="done/a.mov",
+    )
+    assert result.outcome is Outcome.ENCODED
+    assert result.output_name == "a_c.mp4"
+    assert result.size_ratio == pytest.approx(0.4)
+    assert result.resolution == "1080x1920"
+    assert result.stored_resolution == "1920x1080"
+    assert result.bit_rate_source == "video_stream"
+    assert result.encode_sec == 2.0
+    assert result.error_tail is None
+
+
+def test_build_result_failed_joins_stderr_and_detail() -> None:
+    encode = policy.EncodeResult(1, "stderr tail", 2.0)
+    result = policy.build_result(
+        "rid", _encode_plan(), make_info(), Outcome.FAILED, FailureReason.ENCODE_FAILED, 3.0,
+        encode=encode, detail="move failed",
+    )
+    assert result.reason == "encode_failed"
+    assert result.output_name is None
+    assert result.error_tail == "stderr tail\nmove failed"
+
+
+def test_build_result_rejects_contradiction() -> None:
+    with pytest.raises(ValueError):
+        policy.build_result("rid", _encode_plan(), make_info(), Outcome.ENCODED, SkipReason.HDR, 1.0)
+
+
+@pytest.mark.parametrize(
+    ("reason", "outcome"),
+    [(SkipReason.NOT_READY, Outcome.SKIPPED), (FailureReason.PROBE_FAILED, Outcome.FAILED)],
+)
+def test_build_result_without_plan_derives_outcome(reason: policy.Reason, outcome: Outcome) -> None:
+    result = policy.build_result_without_plan("rid", SRC, 123, reason, 1.0, "detail", "failed/a.mov")
+    assert result.outcome is outcome
+    assert result.reason == reason.value
+    assert result.source_name == "a.mov"
+    assert result.source_size == 123
+    assert result.moved_to == "failed/a.mov"
+    assert result.error_tail == "detail"
+    assert result.video_codec is None
