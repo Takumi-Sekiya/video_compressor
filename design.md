@@ -1,13 +1,17 @@
 # 動画ファイル一括圧縮ツール 設計書
 
-- 版数: 0.2
+- 版数: 0.3
 - 作成日: 2026-08-31
-- 前版: detailed_design.md v0.1
+- 更新日: 2026-11-10
+- 前版: design.md v0.2（その前は detailed_design.md v0.1）
 - 対象要件: 要件定義書 v1.1
 - 本書の範囲: 方式選定、モジュール構成、公開インターフェース、データフロー、実装順序。実装コードは含まない
 
 v0.1 に対するレビューで指摘された 7 件の重大な設計欠陥（後述）を反映した改訂版です。
 v0.1 からの変更点は各節の末尾に「**v0.1 からの変更**」として記載します。
+
+v0.3 は、v0.2 の実装中に見つかった不整合を合意のうえ反映したものです。
+v0.2 からの変更点は「**v0.2 からの変更**」として記載し、一覧を末尾の「付録 2」に置きます。
 
 ---
 
@@ -65,12 +69,14 @@ video-compressor/
 │   ├── test_probe_parse.py  # 固定 JSON に対する parse_probe_json() のテスト
 │   ├── test_process_one.py  # 依存注入によるパイプライン結合テスト（実 ffmpeg を起動しない）
 │   ├── test_workspace.py    # tmp_path 上でのファイル操作のテスト
+│   ├── test_runlog.py       # CSV / meta.json の書き出しのテスト（段階 7）
+│   ├── test_run.py          # run() の終了コードと dry-run の不変条件（段階 9。実 ffmpeg を起動しない）
 │   └── test_architecture.py # モジュール間の不変条件を ast で検査
 ├── fixtures/
-│   └── probe/               # ffprobe の実出力を保存した JSON
-│       ├── iphone_hevc_landscape.json
-│       ├── iphone_hevc_portrait_rot90.json   # 回転素材（必須）
-│       ├── iphone_hdr_hlg.json
+│   └── probe/               # ffprobe の実出力を保存した JSON（収集手順は README.md）
+│       ├── landscape_hevc.json               # 横位置 HEVC
+│       ├── portrait_rot90.json               # 回転素材（必須）
+│       ├── hdr_hlg.json                      # HDR（HLG）
 │       ├── slowmo_240fps.json                # VFR / 高 fps 素材（必須）
 │       ├── no_audio.json                     # 音声なし素材（必須）
 │       └── missing_bitrate.json              # bit_rate 欠落素材
@@ -484,7 +490,6 @@ class RunContext:
     argv: tuple[str, ...]
     root: Path
     options: Options
-    policy_constants: dict[str, object]   # policy.export_constants() の結果
     dry_run: bool
     keep_in: bool
     ffmpeg_version: str
@@ -504,6 +509,12 @@ class RunContext:
 - `bit_rate_source` / `fps_source`: どの経路で求めた値かが分からないと、閾値調整のときに素材ごとの推定精度の違いが混ざります
 
 `EncodeResult.ok` プロパティは削除しました（`returncode == 0` の別名で、呼び出し箇所は 1 つです）。
+
+**v0.2 からの変更**: `RunContext` から `policy_constants: dict[str, object]` を削除しました。
+`frozen=True` の dataclass に mutable な `dict` を持たせており、`VideoInfo.raw_probe` を削除したのと
+同じ理由（`hash()` が `TypeError` になる）で `frozen` の意図が崩れていました。
+定数は実行中に変わらないモジュール定数なので、`runlog.create_run_log()` が meta.json を書くときに
+`policy.export_constants()` を呼んで `policy_constants` として書き出します。meta.json の形式は変わりません。
 
 ### `policy.py` — 関数
 
@@ -584,13 +595,20 @@ def build_ffmpeg_args(
 ) -> tuple[str, ...]:
     """ffmpeg に渡す完全な引数列を組み立てる。
 
+    output_path は ffmpeg が書き込む先（呼び出し側は .part のパスを渡す）。
+
     - -c:v は options.video_codec、-crf / -preset は options の値
     - -tag:v hvc1 を必ず含める（C-2）
+    - -map 0:V:0（カバー画像を除く最初の映像）と、音声があれば -map 0:a:0 を明示する。
+      parse_probe_json() が VideoInfo に採ったストリームと一致させるため
     - 音声は 3 分岐:
         audio_codec is None                        -> -an
         audio_codec in options.audio_copy_codecs   -> -c:a copy
         それ以外                                    -> -c:a aac -b:a <fallback>
     - -map_metadata 0 と -movflags +faststart を常に付与する
+    - -f mp4 を付与する（書き込み先が .part で、拡張子から形式を推定できないため）
+    - -y を付与する（書き込み先は常にロック下の .part。前回の異常終了で残った .part を
+      上書きできないと、確認待ちのまま失敗するため）
     - options.strip_location が True のとき、位置情報タグを空文字で上書きする
     """
     ...
@@ -633,18 +651,43 @@ def resolve_dest_dir(
     ...
 
 
-def build_result(...) -> Result: ...
+def build_result(
+    run_id: str,
+    plan: Plan,
+    info: VideoInfo,
+    outcome: Outcome,
+    reason: Reason | None,
+    total_sec: float,
+    *,
+    output_size: int | None = None,
+    encode: EncodeResult | None = None,
+    moved_to: str | None = None,
+    detail: str | None = None,
+) -> Result:
+    """Plan と VideoInfo がある素材の Result を組み立てる。
+
+    output_size はエンコードが成功した場合に渡す（NO_GAIN / OUTPUT_INVALID でも渡す。
+    B-4 の閾値調整に破棄した出力のサイズ比が要るため）。output_name は ENCODED のときだけ埋める。
+
+    Raises:
+        ValueError: outcome と reason の組み合わせが矛盾するとき。
+    """
+    ...
 
 
-def build_failure_result(
+def build_result_without_plan(
     run_id: str,
     source: Path,
     source_size: int,
-    reason: FailureReason,
+    reason: Reason,
     total_sec: float,
     detail: str | None,
+    moved_to: str | None = None,
 ) -> Result:
-    """Plan が存在しない失敗（probe 失敗など）のための Result を組み立てる。"""
+    """Plan が存在しない素材（安定待ちタイムアウト、probe 失敗）の Result を組み立てる。
+
+    outcome は reason の型から決まる（SkipReason -> SKIPPED、FailureReason -> FAILED）。
+    """
     ...
 
 
@@ -674,6 +717,18 @@ probe に失敗した素材には `VideoInfo` が存在しないので、`decide
 純粋関数ではありますが、`policy.py` の責務は判定です。定数 + データ構造 7 種 + 関数 12 種に
 表示整形まで加えると、「`models.py` を分けない理由」として挙げた総量の少なさが成立しなくなります。
 
+**v0.2 からの変更**: `build_failure_result()` を `build_result_without_plan()` に改め、
+`reason` を `Reason`（`SkipReason | FailureReason`）に広げ、`moved_to` を追加しました。
+
+`NOT_READY` は probe より前に決まるため `Plan` も `VideoInfo` もありません。v0.2 では
+`build_result()`（`Plan` と `VideoInfo` が必須）でも `build_failure_result()`（`FailureReason` 専用）でも
+その `Result` を組み立てられず、v0.1 の H-3 と同じ「型として呼べない経路」になっていました。
+また `PROBE_FAILED` の原本は `failed/` へ移るのに、`build_failure_result()` には移動先を受け取る引数がなく、
+`Result.moved_to` を埋められませんでした。`build_result()` の引数もここで確定させています。
+
+`build_ffmpeg_args()` の docstring に、v0.2 では暗黙だった引数（`-map`、`-f mp4`、`-y`）を明記しました。
+いずれも挙動の追加ではなく、記載どおりに動かすために必要なものです（理由は docstring に記載）。
+
 ### `ffmpeg_io.py`
 
 ```python
@@ -702,12 +757,16 @@ def check_tools() -> tuple[str, str]:
     ...
 
 
-def parse_probe_json(payload: dict, path: Path, size_bytes: int) -> VideoInfo:
+def parse_probe_json(payload: dict[str, object], path: Path, size_bytes: int) -> VideoInfo:
     """ffprobe の JSON 出力を VideoInfo へ変換する。副作用を持たない。
 
+    映像はカバー画像（disposition.attached_pic）を除く最初の映像ストリーム、
+    音声は最初の音声ストリームを採る（build_ffmpeg_args() の -map と一致させる）。
     fps: avg_frame_rate を優先し、0/0 または欠落のときのみ r_frame_rate を使う。
          採用元を fps_source に記録する。
-    rotation: side_data_list の displaymatrix を優先し、なければ tags.rotate。
+    rotation: 時計回りの角度（tags.rotate と同じ向き。iPhone の縦位置は 90）。
+              side_data_list の Display Matrix を優先し、なければ tags.rotate。
+              Display Matrix の rotation は反時計回りの角度なので符号を反転してから、
               0 / 90 / 180 / 270 に正規化する（負値は +360 して丸める）。
 
     Raises:
@@ -717,10 +776,21 @@ def parse_probe_json(payload: dict, path: Path, size_bytes: int) -> VideoInfo:
     ...
 
 
-def probe(path: Path, timeout_sec: float = FFPROBE_TIMEOUT_SEC) -> VideoInfo:
-    """ffprobe を起動して素材を解析する。
+def probe_json(path: Path, timeout_sec: float = FFPROBE_TIMEOUT_SEC) -> dict[str, object]:
+    """ffprobe を起動し、JSON 出力をそのまま辞書として返す。
 
     Raises:
+        FFmpegNotFoundError: ffprobe の起動自体に失敗したとき。
+        ProbeError: 非ゼロ終了、タイムアウト、JSON として解釈できないとき。
+    """
+    ...
+
+
+def probe(path: Path, timeout_sec: float = FFPROBE_TIMEOUT_SEC) -> VideoInfo:
+    """ffprobe を起動して素材を解析する。probe_json() と parse_probe_json() の合成。
+
+    Raises:
+        FFmpegNotFoundError: ffprobe の起動自体に失敗したとき。
         ProbeError: 非ゼロ終了、タイムアウト、JSON として解釈できない、
             または parse_probe_json が失敗したとき。
     """
@@ -759,6 +829,19 @@ bpp は fps で割るため、fps が 4 倍に見積もられれば bpp は 1/4 
 素材が LOW_BPP でスキップされず、無駄にエンコードされます。** 主要素材で確実に外れる既定値でした。
 
 `rotation` の取得と `probe_duration()` も v0.2 での追加です（それぞれ後述の H-4 / 出力検証に対応）。
+
+**v0.2 からの変更**: 2 点あります。
+
+- `probe_json()` を追加し、`probe()` をその合成にしました。v0.2 は `--debug` 時に生 JSON を
+  `logs/<run_id>-probe/` へ落とすとしながら、`probe()` が `VideoInfo` しか返さないため、
+  `compress.py` が生 JSON を受け取る経路がありませんでした。`--debug` 時は `compress.py` が
+  `probe_json()` → `runlog.dump_raw_probe()` → `parse_probe_json()` を組み合わせます
+  （parse に失敗した素材の生 JSON も残るように、dump を parse より先に行います）
+- `rotation` の向きを明記しました。v0.2 は「displaymatrix を優先し、負値は +360」とだけ書いていましたが、
+  ffprobe が Display Matrix について出す `rotation` は**反時計回り**の角度で、iPhone の縦位置素材は
+  `-90` になります（ffmpeg 6.1 で確認）。そのまま +360 すると 270 になり、段階 4 の完了条件
+  「縦位置 fixture で `rotation == 90`」と食い違います。`tags.rotate`（時計回り）に向きを揃えます。
+  `display_size()` は 90 と 270 のどちらでも縦横を入れ替えるので、判定結果は変わりません
 
 ### `workspace.py`
 
@@ -952,7 +1035,8 @@ def create_run_log(layout: Layout, context: RunContext) -> tuple[Path, str]:
 
     open(path, "x") で作成する。FileExistsError なら run_id に -2, -3 と
     suffix を付けて再試行する。同一秒の再起動で前回のログを truncate しないため。
-    メタ JSON はこの時点で完成させて書き切る。
+    メタ JSON はこの時点で完成させて書き切る。policy_constants には
+    policy.export_constants() の結果を書く。
     CSV はヘッダ行のみを書いた状態で返す。エンコーディングは utf-8-sig（R-7）。
     """
     ...
@@ -1020,6 +1104,7 @@ def process_one(
     args: CliArgs,
     run_id: str,
     *,
+    stable_fn: Callable[[Path], bool] = workspace.wait_until_stable,
     probe_fn: Callable[[Path], VideoInfo] = ffmpeg_io.probe,
     encode_fn: Callable[[tuple[str, ...]], EncodeResult] = ffmpeg_io.run_ffmpeg,
     duration_fn: Callable[[Path], float | None] = ffmpeg_io.probe_duration,
@@ -1031,12 +1116,29 @@ def process_one(
     素材ローカルな失敗（ProbeError, OSError, ffmpeg の非ゼロ終了）は
     Result に畳み込んで返す（F-8）。
     実行全体を止めるべき例外（FFmpegNotFoundError）は再送出する。
+
+    OSError の畳み込み先:
+      - 安定待ち中（原本が消えた等）       -> SKIPPED / NOT_READY（原本は動かさない）
+      - probe 中                           -> FAILED / PROBE_FAILED
+      - エンコード〜リネーム中             -> FAILED / ENCODE_FAILED（.part を消し、原本は in/ に残す）
+      - 原本の移動                         -> outcome はそのまま。moved_to を None にし error_tail に記録
     """
     ...
 
 
-def run(argv: list[str] | None = None) -> int:
+def run(
+    argv: list[str] | None = None,
+    *,
+    check_tools_fn: Callable[[], tuple[str, str]] = ffmpeg_io.check_tools,
+    probe_fn: Callable[[Path], VideoInfo] = ffmpeg_io.probe,
+    encode_fn: Callable[[tuple[str, ...]], EncodeResult] = ffmpeg_io.run_ffmpeg,
+    duration_fn: Callable[[Path], float | None] = ffmpeg_io.probe_duration,
+) -> int:
     """バッチ全体を実行する。
+
+    注入した関数は process_one() と dry-run の probe にそのまま渡す。
+    --debug（本実行のみ）のときは probe_fn の代わりに、生 JSON を保存してから
+    parse_probe_json() する関数を組み立てて使う。
 
     Returns:
         0: 失敗なし
@@ -1072,6 +1174,16 @@ v0.1 は「例外を送出しない。すべての失敗を Result に畳み込�
 `FFmpegNotFoundError` は 1 素材の失敗ではありません。これを畳み込むと、全素材で
 ENCODE_FAILED を積み上げてから終了コード 1 で終わることになります。即座に中止すべきです。
 
+**v0.2 からの変更**: 依存注入の口を 2 か所足しました。
+
+- `process_one()` に `stable_fn` を追加しました。`NOT_READY` は `wait_until_stable()` が False を返す経路ですが、
+  v0.2 の 3 つの注入口では、`monkeypatch` か実時間で `STABILITY_TIMEOUT_SEC`（900 秒）待つ以外に
+  この経路を通せず、段階 8 の完了条件（`NOT_READY` のテスト、合計 5 秒未満）を満たせませんでした
+- `run()` にキーワード専用の `check_tools_fn` / `probe_fn` / `encode_fn` / `duration_fn` を追加しました。
+  v0.2 の `run()` は `check_tools()`（`ffmpeg -version` の起動）を必ず通るため、段階 9 の終了コードと
+  dry-run の不変条件を「実 ffmpeg を起動しない」テストで検証できませんでした。
+  `process_one()` と同じく既定値付きなので、`main()` からの呼び出しは変わりません
+
 ---
 
 ## データフロー（Mermaid）
@@ -1081,20 +1193,27 @@ ENCODE_FAILED を積み上げてから終了コード 1 で終わることにな
 ```mermaid
 flowchart TD
     start([main]) --> parse[parse_args]
-    parse --> ensure[workspace.ensure_layout<br/>rename スモークテスト]
+    parse --> dryrun{dry_run?}
+
+    dryrun -->|Yes| rootd{root がディレクトリか<br/>Layout root を値として作る}
+    rootd -->|No| exit2[終了コード 2]
+    rootd -->|Yes| toolsd{ffmpeg_io.check_tools}
+    toolsd -->|不在| exit2
+    toolsd -->|OK| scand[in/ があれば scan_inbox<br/>なければ 0 本]
+    scand --> spaced{check_free_space<br/>合計サイズ分の空き}
+    spaced -->|不足| exit2
+    spaced -->|OK| loopd[各素材: probe -> classify -> format_plan を表示]
+    loopd --> exit0([終了コード 0])
+
+    dryrun -->|No| ensure[workspace.ensure_layout<br/>rename スモークテスト]
     ensure --> lock{workspace.acquire_lock}
-    lock -->|失敗| exit2[終了コード 2]
+    lock -->|失敗| exit2
     lock -->|成功| tools{ffmpeg_io.check_tools}
     tools -->|不在| exit2
     tools -->|OK| scan[workspace.scan_inbox]
     scan --> space{check_free_space<br/>合計サイズ分の空き}
     space -->|不足| exit2
-    space -->|OK| dryrun{dry_run?}
-
-    dryrun -->|Yes| loopd[各素材: probe -> classify -> format_plan を表示]
-    loopd --> exit0([終了コード 0])
-
-    dryrun -->|No| cleanup[cleanup_stale_parts<br/>mtime が古いものだけ]
+    space -->|OK| cleanup[cleanup_stale_parts<br/>mtime が古いものだけ]
     cleanup --> meta[runlog.create_run_log<br/>meta.json を書き切る]
     meta --> loop[各素材: process_one]
     loop --> append[runlog.append_result]
@@ -1106,17 +1225,26 @@ flowchart TD
     code -->|No| exit0
 ```
 
-`.part` の掃除と `meta.json` の書き出しは dry-run 経路を通りません。
+ディレクトリ作成と rename スモークテスト（`ensure_layout()`）、`.lock` の作成、`.part` の掃除、
+`meta.json` の書き出し、`--debug` の生 JSON の保存、`wait_until_stable()` は dry-run 経路を通りません。
 **dry-run は `<root>` を一切変更しません。** これを不変条件とします。
+
+dry-run はロックを取りません。何も書かないので、本実行と並行して走っても進行中の処理を壊しません
+（H-6 で問題になったのは dry-run の `.part` 掃除で、それは既に dry-run から外しています）。
+
+**v0.2 からの変更**: dry-run の分岐を `parse_args` の直後に移しました。v0.2 の図では
+`ensure_layout()`（ディレクトリ作成と、`in/` に一時ファイルを作って `done/` へ rename するスモークテスト）と
+`acquire_lock()`（`.lock` の作成と削除）が dry-run の分岐より前にあり、`<root>` / `in/` / `done/` の
+mtime が必ず変わるため、直下の不変条件および段階 9 の完了条件（実行前後で mtime が不変）と両立しませんでした。
 
 ### 1 素材の処理（`process_one`）
 
 ```mermaid
 flowchart TD
-    s([source]) --> stable{wait_until_stable<br/>mtime が静かなら即 True}
+    s([source]) --> stable{stable_fn = wait_until_stable<br/>mtime が静かなら即 True}
     stable -->|False| notready[SKIPPED / NOT_READY<br/>原本は in/ に残す]
     stable -->|True| probe{probe_fn}
-    probe -->|ProbeError| pf[FAILED / PROBE_FAILED<br/>build_failure_result<br/>原本を failed/ へ]
+    probe -->|ProbeError| pf[FAILED / PROBE_FAILED<br/>build_result_without_plan<br/>原本を failed/ へ]
     probe -->|VideoInfo| classify{policy.classify}
 
     classify -->|SkipReason| skip[Plan action=SKIP]
@@ -1409,6 +1537,8 @@ manifest に調整時点の条件を残すことにしました。
 
 この段階を後回しにすると段階 4 のテストが書けません。**実素材が手元にない場合はここで止まります。**
 
+ファイル名と収集手順は `fixtures/probe/README.md` に従います。
+
 ### 段階 4: `ffmpeg_io.parse_probe_json()` + `tests/test_probe_parse.py`
 
 **作るもの**: `parse_probe_json()` のみ（プロセス起動はまだ）
@@ -1448,9 +1578,9 @@ manifest に調整時点の条件を残すことにしました。
 
 ### 段階 7: `runlog.py`
 
-**作るもの**: 全関数
+**作るもの**: 全関数、`tests/test_runlog.py`
 
-**完了条件**:
+**完了条件**（手動と明記したもの以外は `tests/test_runlog.py`）:
 - `create_run_log()` を同一 `run_id` で 2 回呼ぶと、2 回目が `-2` 付きのファイルを作る（既存を消さない）
 - meta.json が `json.load()` で読み戻せ、`options` と `policy_constants` が揃っている
 - `append_result()` を 3 回呼んだ CSV が `csv.DictReader` で 3 行として読める
@@ -1472,7 +1602,7 @@ manifest に調整時点の条件を残すことにしました。
 - `ENCODE_FAILED`（`encode_fn` が `returncode=1`）→ `.part` が消え、原本が `in/` に残る
 - **`PROBE_FAILED`（`probe_fn` が `ProbeError`）→ `Result.outcome == FAILED` で、原本が `failed/` にある**
 - HDR / LOW_BPP / UNSUPPORTED → それぞれの `skipped/` サブディレクトリに原本がある
-- `NOT_READY` → 原本が `in/` に残る
+- `NOT_READY`（`stable_fn` が False）→ 原本が `in/` に残る
 - `--keep-in` 指定時、上記すべてで原本が動かない
 - `FFmpegNotFoundError` は `Result` に畳み込まれず再送出される
 - どの経路でも `Result` の全フィールドが埋まる（`None` 許容フィールド以外）
@@ -1481,9 +1611,9 @@ manifest に調整時点の条件を残すことにしました。
 
 ### 段階 9: `compress.py` の CLI とループ
 
-**作るもの**: `parse_args()`, `format_plan()`, `build_run_context()`, `run()`, `main()`
+**作るもの**: `parse_args()`, `format_plan()`, `build_run_context()`, `run()`, `main()`, `tests/test_run.py`
 
-**完了条件**:
+**完了条件**（`--help` 以外は `run()` にフェイクを注入した `tests/test_run.py`。実 ffmpeg を起動しない）:
 - `--help` が全オプションを表示する
 - `--dry-run` が `<root>` を一切変更しない（実行前後で `find <root> -newer` が空、または全ファイルの mtime が不変）
 - ロック取得失敗で終了コード 2
@@ -1567,3 +1697,20 @@ Q-8（再生時間の許容差）を追加しました。
 bpp の映像ビットレート化、`avg_frame_rate` 優先、音声なし素材の `-an`、`encode_sec` / `total_sec` の分離、
 空き容量チェック、出力の再生時間検証、`run_id` の衝突回避、`failed/` の新設、
 `test_architecture.py`、位置情報の明示。
+
+---
+
+## 付録 2: v0.2 の実装中に見つかった不整合と対応（v0.3）
+
+I-1〜I-5 は作者と合意のうえで反映しました。I-6〜I-8 は v0.2 の記述・完了条件と矛盾しない範囲での明確化です。
+
+| # | 不整合 | 対応 | 反映箇所 |
+|---|---|---|---|
+| I-1 | フロー図で `ensure_layout()` と `acquire_lock()` が dry-run 分岐より前にあり、「dry-run は `<root>` を一切変更しない」と両立しない | dry-run 分岐を `parse_args` 直後に移動。dry-run は Layout を値として作るだけで、ディレクトリ作成・スモークテスト・ロックを行わない | データフロー（実行全体） |
+| I-2 | `NOT_READY` の経路を `monkeypatch` か実時間 900 秒の待機なしにテストできない | `process_one()` に `stable_fn` を追加 | `compress.py`、段階 8 |
+| I-3 | `run()` が必ず `check_tools()` で実 ffmpeg を起動し、段階 9 をテストで検証できない | `run()` にキーワード専用の注入口を追加 | `compress.py`、段階 9 |
+| I-4 | `--debug` の生 JSON を `compress.py` が受け取る経路がない | `ffmpeg_io.probe_json()` を追加し、`probe()` をその合成にする | `ffmpeg_io.py` |
+| I-5 | `RunContext`（frozen）が mutable な `dict` を持つ。`NOT_READY` の `Result` を組み立てる関数がない。`build_failure_result()` に `moved_to` がない | `RunContext.policy_constants` を削除し `runlog` が `export_constants()` を呼ぶ。`build_result_without_plan()` に改め `Reason` と `moved_to` を受け取る | データ構造、`policy.py`、`runlog.py` |
+| I-6 | Display Matrix の `rotation`（反時計回り。iPhone 縦位置で -90）をそのまま正規化すると 270 になり、段階 4 の完了条件（90）と食い違う | `VideoInfo.rotation` を時計回りと定義し、Display Matrix の値は符号を反転してから正規化 | `parse_probe_json()` |
+| I-7 | fixture のファイル名が本書と `fixtures/probe/README.md` で異なる | README の名前に統一 | ディレクトリ構成 |
+| I-8 | `build_ffmpeg_args()` が `.part` に書くのに出力形式の指定がなく、ffmpeg が形式を推定できず失敗する。ストリーム選択も暗黙 | `-f mp4` / `-map` / `-y` を docstring に明記 | `policy.build_ffmpeg_args()` |

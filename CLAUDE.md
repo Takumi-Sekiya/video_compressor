@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-動画ファイル一括圧縮ツールの開発ガイド。`design.md` v0.2 に沿って実装する。
+動画ファイル一括圧縮ツールの開発ガイド。`design.md` v0.3 に沿って実装する。
 
 **このファイルは毎回コンテキストに載る。追記するときは「知らないと事故る情報」だけにする。**
 背景・経緯・判断理由は `design.md` に書く。ここには書かない。
@@ -134,6 +134,7 @@ None を忘れると音声なし素材でエンコードが落ちる。
 ### dry-run は `<root>` を一切変更しない
 
 `.part` の掃除も `meta.json` の書き出しも `wait_until_stable()` も dry-run では走らない。
+`ensure_layout()`（mkdir と rename スモークテスト）と `acquire_lock()` も走らない。dry-run の分岐は `parse_args` の直後。
 これは不変条件。テストで検証する。
 
 ### `SkipReason` と `FailureReason` は別の enum
