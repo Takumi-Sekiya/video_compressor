@@ -70,7 +70,7 @@ python compress.py --root /tmp/testroot --dry-run   # tmp 上のダミーに対�
 ### 進捗
 
 - [x] 段階 1: `policy.py` のデータ構造と定数
-- [ ] 段階 2: `policy.py` の純粋関数 + `tests/test_policy.py`
+- [x] 段階 2: `policy.py` の純粋関数 + `tests/test_policy.py`
 - [ ] 段階 3: `fixtures/probe/` の収集（**要: 実素材。ここで人の作業が要る**）
 - [ ] 段階 4: `parse_probe_json()` + `tests/test_probe_parse.py`
 - [ ] 段階 5: `ffmpeg_io` のプロセス起動
