@@ -71,8 +71,8 @@ python compress.py --root /tmp/testroot --dry-run   # tmp 上のダミーに対�
 
 - [x] 段階 1: `policy.py` のデータ構造と定数
 - [x] 段階 2: `policy.py` の純粋関数 + `tests/test_policy.py`
-- [ ] 段階 3: `fixtures/probe/` の収集（**要: 実素材。ここで人の作業が要る**）
-- [ ] 段階 4: `parse_probe_json()` + `tests/test_probe_parse.py`
+- [ ] 段階 3: `fixtures/probe/` の収集（**要: 実素材。ここで人の作業が要る**）← 未収集
+- [ ] 段階 4: `parse_probe_json()` + `tests/test_probe_parse.py` ← 実装済み。fixture 未収集のためテストの大半が skip。揃ったら skip が消えることを確認して完了
 - [ ] 段階 5: `ffmpeg_io` のプロセス起動
 - [ ] 段階 6: `workspace.py` + `tests/test_workspace.py`
 - [ ] 段階 7: `runlog.py`
