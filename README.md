@@ -24,6 +24,60 @@ iPhone から SMB 共有にコピーした動画を ffmpeg（libx265）で一括
    .venv\Scripts\pytest
    ```
 
+## SMB 共有の設定
+
+- 共有するのは `--root` に指定するフォルダ 1 つだけ。`in / out / skipped / failed / done / logs` は初回実行時にその中へ作られる
+- 共有には共有専用のローカルユーザーを作って使う（Microsoft アカウントでは iOS からの認証が通らないことが多い）
+- ネットワークプロファイルは「プライベート」にする。LAN の外へは公開しない
+- `in / out / done` などは必ず同じボリュームに置く（起動時に rename で検査し、失敗したら終了コード 2 で止まる）
+
+## 使い方
+
+```powershell
+# 判定と ffmpeg コマンドを表示するだけ。<root> は一切変更しない（ロックも取らない）
+python compress.py --root D:\share --dry-run
+
+# 本実行
+python compress.py --root D:\share
+```
+
+主なオプション（全一覧は `python compress.py --help`）:
+
+| オプション | 既定値 | 用途 |
+|---|---|---|
+| `--crf` / `--preset` | 26 / slow | 画質とサイズ（B-1 / B-2） |
+| `--short-side` / `--no-downscale` | 1080 / 縮小する | 短辺の上限（偶数） |
+| `--min-gain-ratio` | 0.90 | 出力 / 原本 がこれを超えたら破棄して `skipped/no_gain/` へ（B-4） |
+| `--bpp-efficient` / `--bpp-legacy` | 0.045 / 0.075 | これ未満の素材は既に高圧縮としてスキップ（B-3） |
+| `--allow-hdr` | 無効 | HDR 素材もエンコードする |
+| `--strip-location` | 無効 | 出力から位置情報タグを消す |
+| `--no-verify-duration` | 無効 | 出力の再生時間の検証を省く |
+| `--keep-in` | 無効 | 原本を `in/` から動かさない（閾値調整用） |
+| `--debug` | 無効 | ffprobe の生 JSON を `logs/<run_id>-probe/` に保存する（本実行のみ） |
+
+終了コード: 0 = 失敗なし / 1 = 失敗した素材がある / 2 = 起動時のエラー（ffmpeg 不在、`--root` 不正、ロック中、容量不足）/ 3 = 実行中に ffmpeg が起動できなくなった
+
+### 実行後のディレクトリの意味
+
+| 場所 | 意味 |
+|---|---|
+| `in/` | 未処理、または `encode_failed` / `output_invalid` / `not_ready` で次回再試行 |
+| `out/*.mp4` | 採用が確定した完成品。iPhone へ戻す |
+| `out/*.part` | 中断の痕跡。1 時間以上古ければ次回の本実行で削除される |
+| `done/` | 処理を終えた原本。目視確認のうえ手動で削除する |
+| `skipped/<理由>/` | 対象外と判定した原本（`hdr` / `low_bpp` / `unsupported` / `no_gain`） |
+| `failed/` | ffprobe で解析できなかった原本。壊れている可能性がある |
+| `logs/<run_id>.csv` / `.meta.json` | 1 実行 1 組。素材ごとの結果と、実行条件の全記録 |
+
+## 運用上の注意
+
+- **`out/` の出力を `in/` に戻さない。** 二重圧縮の検出はしていない（LOW_BPP がほぼ拾うが保証はしない）
+- `--keep-in` で調整を繰り返すと、原本が `in/` に残るため毎回再処理され、`out/` に `_c_2.mp4`, `_c_3.mp4` と世代が溜まる。**調整サイクルの前に `out/` を空にする**
+- `-map_metadata 0` により撮影日時と**位置情報も出力に引き継ぐ。これは意図した挙動**（Q-6）。出力を第三者に渡すなら `--strip-location` を付ける
+- 同じ素材が毎回 `encode_failed` になる場合、ツールは回数を数えない（状態を持たない）。`in/` から `failed/` へ手動で退避する（Q-7）
+- `.lock` が残っていて起動できない場合は、前回が異常終了している。実行中のプロセスがないことを確認してから `.lock` を削除する
+- 転送中のファイルは、mtime が 30 秒以内なら 5 秒間隔でサイズが 3 回一致するまで待つ（最大 900 秒。超えたら `not_ready` で `in/` に残す）。コピー中は iPhone の画面を点灯させておく
+
 ## 手動確認の手順
 
 自動テストは実 ffmpeg を起動しない。ffmpeg / ffprobe を実際に起動する部分は以下の手順で手動確認する。

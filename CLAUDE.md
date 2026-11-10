@@ -77,7 +77,7 @@ python compress.py --root /tmp/testroot --dry-run   # tmp 上のダミーに対�
 - [x] 段階 6: `workspace.py` + `tests/test_workspace.py`
 - [ ] 段階 7: `runlog.py` ← 実装済み。Excel での文字化け確認（手動、README）が残り
 - [x] 段階 8: `process_one()` + `tests/test_process_one.py`（**最重要**）
-- [ ] 段階 9: `compress.py` の CLI とループ
+- [x] 段階 9: `compress.py` の CLI とループ
 - [ ] 段階 10: `tests/test_architecture.py`
 - [ ] 段階 11: 実素材での試運転
 
