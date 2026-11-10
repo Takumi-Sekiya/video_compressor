@@ -74,7 +74,7 @@ python compress.py --root /tmp/testroot --dry-run   # tmp 上のダミーに対�
 - [ ] 段階 3: `fixtures/probe/` の収集（**要: 実素材。ここで人の作業が要る**）← 未収集
 - [ ] 段階 4: `parse_probe_json()` + `tests/test_probe_parse.py` ← 実装済み。fixture 未収集のためテストの大半が skip。揃ったら skip が消えることを確認して完了
 - [ ] 段階 5: `ffmpeg_io` のプロセス起動 ← 実装済み。実素材での probe() 一致確認（README 手順 2）と Windows での確認が残り
-- [ ] 段階 6: `workspace.py` + `tests/test_workspace.py`
+- [x] 段階 6: `workspace.py` + `tests/test_workspace.py`
 - [ ] 段階 7: `runlog.py`
 - [ ] 段階 8: `process_one()` + `tests/test_process_one.py`（**最重要**）
 - [ ] 段階 9: `compress.py` の CLI とループ
