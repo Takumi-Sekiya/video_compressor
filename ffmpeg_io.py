@@ -5,10 +5,16 @@
 
 from __future__ import annotations
 
+import json
 import math
+import subprocess
+import time
 from pathlib import Path
 
-from policy import VideoInfo
+from policy import FFPROBE_TIMEOUT_SEC, STDERR_TAIL_LINES, EncodeResult, VideoInfo
+
+# R-7: subprocess の text=True はロケール依存（Windows では cp932）で日本語ファイル名が化けるため、
+# 以下の subprocess.run はすべて encoding="utf-8", errors="replace" を明示する。
 
 
 class FFmpegNotFoundError(RuntimeError):
@@ -172,4 +178,157 @@ def parse_probe_json(payload: dict[str, object], path: Path, size_bytes: int) ->
         audio_bit_rate_bps=audio_bit_rate,
         color_transfer=_as_str(video.get("color_transfer")),
         color_primaries=_as_str(video.get("color_primaries")),
+    )
+
+
+# ---------------------------------------------------------------------------
+# プロセス起動
+# ---------------------------------------------------------------------------
+
+
+def _tail(text: str, lines: int) -> str:
+    return "\n".join(text.splitlines()[-lines:])
+
+
+def _version_line(tool: str) -> str:
+    try:
+        completed = subprocess.run(
+            [tool, "-version"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=FFPROBE_TIMEOUT_SEC,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise FFmpegNotFoundError(f"{tool} を起動できない: {exc}") from exc
+    if completed.returncode != 0:
+        raise FFmpegNotFoundError(
+            f"{tool} -version が異常終了した（{completed.returncode}）: {_tail(completed.stderr, 3)}"
+        )
+    first_line = completed.stdout.splitlines()[0] if completed.stdout else ""
+    return first_line.strip()
+
+
+def check_tools() -> tuple[str, str]:
+    """ffmpeg / ffprobe の存在とバージョンを確認する。起動直後に 1 回だけ呼ぶ。
+
+    Returns:
+        (ffmpeg のバージョン行, ffprobe のバージョン行)。
+
+    Raises:
+        FFmpegNotFoundError: どちらかが PATH 上にない、または起動に失敗したとき。
+    """
+    return _version_line("ffmpeg"), _version_line("ffprobe")
+
+
+def probe_json(path: Path, timeout_sec: float = FFPROBE_TIMEOUT_SEC) -> dict[str, object]:
+    """ffprobe を起動し、JSON 出力をそのまま辞書として返す。
+
+    Raises:
+        FFmpegNotFoundError: ffprobe の起動自体に失敗したとき。
+        ProbeError: 非ゼロ終了、タイムアウト、JSON として解釈できないとき。
+    """
+    args = [
+        "ffprobe", "-v", "error", "-print_format", "json",
+        "-show_format", "-show_streams", str(path),
+    ]
+    try:
+        completed = subprocess.run(
+            args,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout_sec,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError as exc:
+        raise FFmpegNotFoundError(f"ffprobe を起動できない: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ProbeError(path, f"ffprobe が {timeout_sec} 秒で終わらなかった") from exc
+    except OSError as exc:
+        raise ProbeError(path, f"ffprobe の起動に失敗した: {exc}") from exc
+
+    if completed.returncode != 0:
+        detail = _tail(completed.stderr, STDERR_TAIL_LINES) or f"returncode={completed.returncode}"
+        raise ProbeError(path, detail)
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ProbeError(path, f"ffprobe の出力を JSON として解釈できない: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ProbeError(path, "ffprobe の出力が JSON オブジェクトでない")
+    return {str(k): v for k, v in payload.items()}
+
+
+def probe(path: Path, timeout_sec: float = FFPROBE_TIMEOUT_SEC) -> VideoInfo:
+    """ffprobe を起動して素材を解析する。probe_json() と parse_probe_json() の合成。
+
+    Raises:
+        FFmpegNotFoundError: ffprobe の起動自体に失敗したとき。
+        ProbeError: 非ゼロ終了、タイムアウト、JSON として解釈できない、
+            または parse_probe_json が失敗したとき。
+    """
+    payload = probe_json(path, timeout_sec)
+    try:
+        size_bytes = path.stat().st_size
+    except OSError as exc:
+        raise ProbeError(path, f"ファイルサイズを取得できない: {exc}") from exc
+    return parse_probe_json(payload, path, size_bytes)
+
+
+def probe_duration(path: Path, timeout_sec: float = FFPROBE_TIMEOUT_SEC) -> float | None:
+    """出力検証用に再生時間だけを取得する。失敗しても例外を送出せず None を返す。"""
+    args = [
+        "ffprobe", "-v", "error", "-print_format", "json",
+        "-show_entries", "format=duration", str(path),
+    ]
+    try:
+        completed = subprocess.run(
+            args,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout_sec,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if completed.returncode != 0:
+            return None
+        payload = json.loads(completed.stdout)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return None
+    return _as_float(_as_dict(_as_dict(payload).get("format")).get("duration"))
+
+
+def run_ffmpeg(
+    args: tuple[str, ...], tail_lines: int = STDERR_TAIL_LINES
+) -> EncodeResult:
+    """ffmpeg を起動し、完了まで待つ。
+
+    タイムアウトは設けない（要件「処理時間に上限は設けない」）。
+    stderr は text=True にせず、encoding="utf-8", errors="replace" を明示する（R-7）。
+    引数はリストで渡し、shell は使わない。
+
+    Returns:
+        EncodeResult。異常終了も例外にせず returncode で表現する（F-8）。
+
+    Raises:
+        FFmpegNotFoundError: ffmpeg の起動自体に失敗したとき。実行全体を中止する。
+    """
+    started = time.monotonic()
+    try:
+        completed = subprocess.run(
+            list(args),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError as exc:
+        raise FFmpegNotFoundError(f"ffmpeg を起動できない: {exc}") from exc
+    return EncodeResult(
+        returncode=completed.returncode,
+        stderr_tail=_tail(completed.stderr, tail_lines),
+        elapsed_sec=time.monotonic() - started,
     )
