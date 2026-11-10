@@ -62,3 +62,12 @@ PowerShell でリポジトリ直下から実行する。`<素材>` は代表素�
 
 確認結果（2026-11-10、Linux コンテナ上の ffmpeg 6.1.1、合成クリップ使用）: 1, 3, 4, 5 は期待どおり。
 2 は実素材と fixture が未収集のため未実施。Windows 上での確認も未実施。
+
+### 段階 7: CSV が Excel で文字化けしない
+
+1. 本実行を 1 回行い（または `python -c` で `runlog.create_run_log()` と `append_result()` を呼び）、`logs\<run_id>.csv` を作る
+2. エクスプローラーから CSV をダブルクリックして Excel で開く
+3. 日本語のファイル名（`source_name` 列）が化けずに表示されること
+
+CSV は先頭に BOM 付きの UTF-8（utf-8-sig）で書いており、BOM が先頭に 1 つだけあることは `tests/test_runlog.py` で確認している。
+Excel での表示は未確認。
